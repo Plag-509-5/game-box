@@ -1,0 +1,16 @@
+# Déploiement en un clic sur Render (https://render.com) : site + API sur la même adresse HTTPS.
+services:
+  - type: web
+    name: box
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_DB
+        value: box
+      - key: MONGODB_URI
+        sync: false # à saisir dans le tableau de bord Render (secret)
