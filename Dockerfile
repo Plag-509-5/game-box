@@ -9,8 +9,10 @@ COPY . .
 RUN npm run build
 
 ENV NODE_ENV=production
+ENV HOST=0.0.0.0
 ENV PORT=8787
 EXPOSE 8787
 
-# MONGODB_URI et MONGODB_DB sont fournis par l'hébergeur (jamais dans l'image).
-CMD ["node", "server.js"]
+# MONGODB_URI, GOOGLE_*… sont fournis par l'hébergeur (jamais dans l'image).
+# « npm start » reconstruit dist/ si besoin, puis lance site + API + PeerJS.
+CMD ["npm", "start"]

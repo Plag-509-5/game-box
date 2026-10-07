@@ -1,11 +1,11 @@
-# Déploiement en un clic sur Render (https://render.com) : site + API sur la même adresse HTTPS.
+# Déploiement en un clic sur Render (https://render.com) : site + API + PeerJS sur la même adresse HTTPS.
 services:
   - type: web
     name: box
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
-    startCommand: node server.js
+    startCommand: npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
@@ -14,3 +14,9 @@ services:
         value: box
       - key: MONGODB_URI
         sync: false # à saisir dans le tableau de bord Render (secret)
+      - key: APP_URL
+        sync: false # ex. https://box.onrender.com (requis pour Google OAuth)
+      - key: GOOGLE_CLIENT_ID
+        sync: false # optionnel : connexion Google
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false # optionnel : connexion Google

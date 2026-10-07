@@ -4,6 +4,7 @@ import {
   checkService,
   currentApiBase,
   getApiOverride,
+  googleStartUrl,
   setApiOverride,
   type PublicUser,
   type ServiceState,
@@ -132,9 +133,34 @@ export function AuthScreen({ onClose }: { onClose: () => void }) {
     if (ok) onClose();
   };
 
+  const googleReady = auth.providers?.google === true && service.state === 'online';
+
   return (
     <Panel>
       <Logo size="sm" />
+
+      {auth.providers?.google === true && (
+        <>
+          <div className="mt-5">
+            <button
+              onClick={() => {
+                window.location.href = googleStartUrl();
+              }}
+              disabled={!googleReady || auth.busy}
+              className="hairline flex w-full items-center justify-center gap-2.5 rounded-xl bg-white px-4 py-2.5 text-[13px] font-bold text-slate-800 transition hover:brightness-95 active:scale-[0.98] disabled:opacity-50"
+            >
+              <GoogleIcon />
+              Continuer avec Google
+            </button>
+          </div>
+          <div className="my-4 flex items-center gap-3">
+            <span className="h-px flex-1 bg-white/[0.08]" />
+            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-600">ou</span>
+            <span className="h-px flex-1 bg-white/[0.08]" />
+          </div>
+        </>
+      )}
+
       <div className="hairline mt-5 flex rounded-xl bg-black/25 p-1">
         {(['login', 'register'] as const).map((item) => (
           <button
@@ -817,15 +843,22 @@ function SecuritySection() {
       <p className="eyebrow mb-4 text-slate-500">Sécurité</p>
       <div className="grid gap-5 md:grid-cols-2">
         <div className="space-y-3">
+          {user.hasPassword ? (
+            <AuthField
+              label="Mot de passe actuel"
+              type="password"
+              value={current}
+              onChange={setCurrent}
+              autoComplete="current-password"
+            />
+          ) : (
+            <p className="text-[11.5px] leading-relaxed text-slate-500">
+              Compte créé avec Google : définis un mot de passe pour pouvoir aussi te connecter
+              avec ton email.
+            </p>
+          )}
           <AuthField
-            label="Mot de passe actuel"
-            type="password"
-            value={current}
-            onChange={setCurrent}
-            autoComplete="current-password"
-          />
-          <AuthField
-            label="Nouveau mot de passe"
+            label={user.hasPassword ? 'Nouveau mot de passe' : 'Mot de passe'}
             type="password"
             value={next}
             onChange={setNext}
@@ -835,10 +868,10 @@ function SecuritySection() {
           />
           <button
             onClick={() => void submit()}
-            disabled={!current || next.length < 8 || auth.busy}
+            disabled={(!user.hasPassword ? false : !current) || next.length < 8 || auth.busy}
             className="w-full rounded-xl bg-white/[0.08] py-2.5 text-[12px] font-semibold text-white transition hover:bg-brand-400 hover:text-ink-950 disabled:opacity-40"
           >
-            Changer le mot de passe
+            {user.hasPassword ? 'Changer le mot de passe' : 'Définir un mot de passe'}
           </button>
           {done && (
             <p className="text-[11px] font-medium text-emerald-400">
@@ -851,8 +884,9 @@ function SecuritySection() {
           <div>
             <p className="text-[12.5px] font-semibold text-white">Session</p>
             <p className="mt-0.5 text-[10.5px] leading-relaxed text-slate-600">
-              Connecté avec {user.email}. Tes identifiants et tes sessions sont stockés dans MongoDB ;
-              le mot de passe est haché et jamais lisible.
+              Connecté avec {user.email} ({user.authProvider === 'google' ? 'compte Google' : 'compte email'}).
+              Tes identifiants et tes sessions sont stockés dans MongoDB ; le mot de passe est haché
+              et jamais lisible.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -882,6 +916,29 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
       <input type="checkbox" className="peer sr-only" checked={checked} onChange={(e) => onChange(e.target.checked)} />
       <span className="relative h-5 w-9 rounded-full bg-white/10 transition peer-checked:bg-brand-400 after:absolute after:left-[3px] after:top-[3px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4" />
     </label>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden>
+      <path
+        fill="#4285F4"
+        d="M23.5 12.3c0-.9-.1-1.5-.3-2.3H12v4.5h6.5c-.1 1.1-.8 2.7-2.4 3.8l-.1.1 3.5 2.7.2.1c2.2-2 3.8-5 3.8-8.9z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.2 0 5.9-1.1 7.9-2.9l-3.7-2.9c-1 .7-2.4 1.2-4.2 1.2-3.2 0-5.9-2.1-6.8-5.1l-.1.1-3.7 2.9v.1C3.5 21.3 7.5 24 12 24z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.2 14.3c-.2-.7-.4-1.5-.4-2.3s.1-1.6.4-2.3l-.1-.1-3.6-2.8-.1.1C.5 8.9 0 10.4 0 12s.5 3.1 1.4 4.4l3.8-2.1z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.7c1.8 0 3 .8 3.7 1.4l3.3-3.2C17.9 1.1 15.2 0 12 0 7.5 0 3.5 2.7 1.4 6.8l3.8 2.9c.9-2.9 3.6-5 6.8-5z"
+      />
+    </svg>
   );
 }
 

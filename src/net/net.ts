@@ -10,7 +10,38 @@ import {
 } from './protocol';
 import type { Edge } from '../game/core';
 
-const PEER_OPTS = { debug: 0 as const };
+type PeerOpts = NonNullable<ConstructorParameters<typeof Peer>[1]>;
+
+/**
+ * Options du serveur PeerJS (signaling du multijoueur).
+ * Par défaut : serveur auto-hébergé sur la même origine (/peerjs), servi par
+ * notre Express — le jeu en ligne ne dépend plus du cloud public PeerJS.
+ * Forcer un autre serveur (dépannage) via :
+ *   VITE_PEER_HOST=0.peerjs.com VITE_PEER_PORT=443 VITE_PEER_PATH=/ VITE_PEER_SECURE=true
+ */
+function peerOptions(): PeerOpts {
+  const env = import.meta.env;
+  const customHost = env.VITE_PEER_HOST as string | undefined;
+  if (customHost) {
+    const secure = env.VITE_PEER_SECURE !== 'false';
+    return {
+      host: customHost,
+      port: Number(env.VITE_PEER_PORT || (secure ? 443 : 80)),
+      path: (env.VITE_PEER_PATH as string) || '/',
+      secure,
+      debug: 0,
+    };
+  }
+  const { hostname, port, protocol } = window.location;
+  const secure = protocol === 'https:';
+  return {
+    host: hostname,
+    port: port ? Number(port) : secure ? 443 : 80,
+    path: '/peerjs',
+    secure,
+    debug: 0,
+  };
+}
 
 /* ==================================================================== */
 /* Presence: always-on peer named after the user, used for friend       */
@@ -45,7 +76,7 @@ export class Presence {
   private open() {
     if (this.destroyed) return;
     const id = userPeerId(this.username);
-    const peer = new Peer(id, PEER_OPTS);
+    const peer = new Peer(id, peerOptions());
     this.peer = peer;
     peer.on('open', () => {
       this.retry = 0;
@@ -257,7 +288,7 @@ export class Room {
       started: false,
     };
     this.set('opening');
-    const peer = new Peer(roomPeerId(code), PEER_OPTS);
+    const peer = new Peer(roomPeerId(code), peerOptions());
     this.peer = peer;
     peer.on('open', () => {
       this.set('lobby');
@@ -409,7 +440,7 @@ export class Room {
     this.cid = name.toLowerCase();
     this.code = code.trim().toUpperCase();
     this.set('opening');
-    const peer = new Peer(PEER_OPTS);
+    const peer = new Peer(peerOptions());
     this.peer = peer;
     peer.on('open', () => this.dialHost());
     peer.on('disconnected', () => {

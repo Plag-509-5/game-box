@@ -94,6 +94,7 @@ export default function App() {
   setupRef.current = setup;
   const pendingCodeRef = useRef<string>('');
   const authNextRef = useRef<'game' | 'online'>('game');
+  const bootErrorOpened = useRef(false);
 
   /* ------------------------------------------------ boot */
   useEffect(() => {
@@ -147,6 +148,14 @@ export default function App() {
       .map((f) => ({ name: f.user.username, added: new Date(f.updatedAt).getTime(), lastSeen: 0 }));
     setFriends(remoteFriends);
   }, [auth.friendships]);
+
+  // Échec du retour Google OAuth (?auth=error) : ouvrir l'écran de compte pour l'afficher.
+  useEffect(() => {
+    if (!auth.loading && !auth.user && auth.error && !bootErrorOpened.current) {
+      bootErrorOpened.current = true;
+      setView('auth');
+    }
+  }, [auth.loading, auth.user, auth.error]);
 
   useEffect(() => {
     if (!canvasRef.current) return;

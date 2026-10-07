@@ -11,6 +11,13 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import { GridFSBucket, MongoClient, ObjectId } from 'mongodb';
+import { ExpressPeerServer } from 'peer';
+import {
+  googleAuthUrl,
+  googleProfileFromCode,
+  googleProfileFromIdToken,
+  isGoogleConfigured,
+} from './google.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
@@ -22,11 +29,18 @@ try {
 }
 const prod = process.env.NODE_ENV === 'production';
 const crossSite = process.env.COOKIE_CROSS_SITE === 'true';
-const port = Number(process.env.PORT || 8787);
+// Pterodactyl injecte SERVER_PORT (allocation) ; HOST/SERVER_HOST pour l'écoute.
+const host = process.env.HOST || process.env.SERVER_HOST || '0.0.0.0';
+const port = Number(process.env.PORT || process.env.SERVER_PORT || 8787);
 const mongoUri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || 'box';
+const APP_URL = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+const FRONTEND_URL = (process.env.FRONTEND_URL || '').trim().replace(/\/+$/, '');
+const googleReady = isGoogleConfigured();
 
 if (!mongoUri) console.error('MONGODB_URI manquant : définis-le dans le fichier .env du serveur.');
+if (!googleReady)
+  console.log('Google OAuth inactif : définis GOOGLE_CLIENT_ID/SECRET (+ APP_URL ou GOOGLE_REDIRECT_URI).');
 
 const SESSION_DAYS = 30;
 const MAX_FAILED_LOGINS = 8;
@@ -87,6 +101,7 @@ async function connectDb() {
 const ensureIndexes = () => Promise.all([
   users.createIndex({ emailLower: 1 }, { unique: true }),
   users.createIndex({ usernameLower: 1 }, { unique: true }),
+  users.createIndex({ googleId: 1 }, { unique: true, sparse: true }),
   sessions.createIndex({ tokenHash: 1 }, { unique: true }),
   sessions.createIndex({ userId: 1 }),
   sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }), // purge automatique
@@ -97,6 +112,17 @@ const ensureIndexes = () => Promise.all([
 
 /* ------------------------------ Express ------------------------------ */
 
+function allowedOrigins() {
+  const list = [process.env.APP_ORIGINS || '', APP_URL, FRONTEND_URL]
+    .join(',')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length
+    ? [...new Set(list)]
+    : ['http://localhost:5173', 'http://localhost:4173', 'http://localhost:8787'];
+}
+
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -104,11 +130,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentS
 app.use(
   cors({
     origin(origin, cb) {
-      const allowed = (
-        process.env.APP_ORIGINS || 'http://localhost:5173,http://localhost:4173,http://localhost:8787'
-      )
-        .split(',')
-        .map((s) => s.trim());
+      const allowed = allowedOrigins();
       const localDev = !prod && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin || '');
       cb(null, !origin || localDev || allowed.includes(origin));
     },
@@ -127,13 +149,14 @@ app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 40, standardHeade
 
 // Diagnostic : toujours disponible, même si MongoDB est injoignable.
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, db: dbReady, reason: dbReady ? '' : dbIssue });
-});
-
-// Tant que MongoDB n'est pas connecté, les autres routes répondent proprement.
-app.use('/api', (_req, res, next) => {
-  if (dbReady) return next();
-  res.status(503).json({ error: 'DB_UNAVAILABLE', reason: dbIssue });
+  res.json({
+    ok: true,
+    db: dbReady,
+    reason: dbReady ? '' : dbIssue,
+    oauth: { google: googleReady },
+    peer: true,
+    time: new Date().toISOString(),
+  });
 });
 
 const upload = multer({
@@ -162,7 +185,8 @@ const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
 function avatarUrl(user) {
-  return user.avatarId ? `/api/users/${user._id}/avatar?v=${user.avatarVersion || 1}` : '';
+  if (user.avatarId) return `/api/users/${user._id}/avatar?v=${user.avatarVersion || 1}`;
+  return user.avatarExternal || ''; // photo du compte Google, le cas échéant
 }
 function publicUser(user) {
   const p = user.preferences || {};
@@ -172,7 +196,8 @@ function publicUser(user) {
     username: user.username,
     displayName: user.displayName || user.username,
     avatarUrl: avatarUrl(user),
-    authProvider: 'email',
+    authProvider: user.authProvider || 'email',
+    hasPassword: !!user.passwordHash,
     preferences: {
       language: p.language || DEFAULT_PREFS.language,
       sound: p.sound ?? DEFAULT_PREFS.sound,
@@ -244,7 +269,153 @@ async function requireUser(req, res, next) {
   }
 }
 
-/* ------------------------------ auth ------------------------------ */
+/* ------------------------------ Google OAuth ------------------------------ */
+// Ces routes sont AVANT le garde anti-DB : elles gèrent elles-mêmes l'absence
+// de base (redirection vers l'interface avec un code d'erreur, pas une page JSON).
+
+const OAUTH_STATE_COOKIE = 'box_oauth_state';
+const oauthStateOptions = {
+  httpOnly: true,
+  secure: prod || crossSite,
+  // Le retour de Google est une navigation cross-site : Strict bloquerait le cookie.
+  sameSite: 'lax',
+  path: '/api/auth/google',
+  maxAge: 10 * 60 * 1000,
+};
+
+// Où renvoyer le navigateur après le consentement Google.
+function frontendBase(req) {
+  if (FRONTEND_URL) return FRONTEND_URL;
+  if (APP_URL) return APP_URL;
+  const origins = allowedOrigins();
+  if (prod && origins.length && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(origins[0])) return origins[0];
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+app.get('/api/auth/providers', (_req, res) => {
+  res.json({ google: googleReady });
+});
+
+// Étape 1 : redirige vers le consentement Google.
+app.get('/api/auth/google', (req, res) => {
+  const base = frontendBase(req);
+  if (!googleReady) {
+    // Navigation directe : on renvoie vers l'interface avec un code d'erreur lisible.
+    if (req.accepts('html')) return res.redirect(302, `${base}/?auth=error&reason=OAUTH_NOT_CONFIGURED`);
+    return res.status(503).json({ error: 'OAUTH_NOT_CONFIGURED' });
+  }
+  if (!dbReady) {
+    if (req.accepts('html')) return res.redirect(302, `${base}/?auth=error&reason=DB_UNAVAILABLE`);
+    return res.status(503).json({ error: 'DB_UNAVAILABLE', reason: dbIssue });
+  }
+  const state = crypto.randomBytes(24).toString('base64url');
+  res.cookie(OAUTH_STATE_COOKIE, state, oauthStateOptions);
+  res.redirect(302, googleAuthUrl(state));
+});
+
+// Étape 2 : Google redirige ici avec ?code=…&state=…
+app.get('/api/auth/google/callback', asyncRoute(async (req, res) => {
+  const base = frontendBase(req);
+  const fail = (reason) => res.redirect(302, `${base}/?auth=error&reason=${reason}`);
+  if (!googleReady) return fail('OAUTH_NOT_CONFIGURED');
+  if (!dbReady) return fail('DB_UNAVAILABLE');
+  const { code, state } = req.query;
+  const expected = req.cookies[OAUTH_STATE_COOKIE];
+  res.clearCookie(OAUTH_STATE_COOKIE, { ...oauthStateOptions, maxAge: undefined });
+  if (!code || !state || !expected || state !== expected) return fail('OAUTH_STATE');
+  let profile;
+  try {
+    profile = await googleProfileFromCode(String(code));
+  } catch (error) {
+    console.error('Google OAuth (callback) :', error?.message || error);
+    return fail('OAUTH_FAILED');
+  }
+  if (!profile.googleId || !EMAIL.test(profile.email) || !profile.emailVerified) return fail('OAUTH_EMAIL');
+  const user = await upsertGoogleUser(profile);
+  await createSession(req, res, user._id);
+  res.redirect(302, `${base}/?auth=google-ok`);
+}));
+
+// Variante API (jeton déjà obtenu côté client) : POST { idToken }.
+app.post('/api/auth/google', asyncRoute(async (req, res) => {
+  if (!googleReady) return res.status(503).json({ error: 'OAUTH_NOT_CONFIGURED' });
+  if (!dbReady) return res.status(503).json({ error: 'DB_UNAVAILABLE', reason: dbIssue });
+  const idToken = String(req.body.idToken || '');
+  if (!idToken) return res.status(400).json({ error: 'OAUTH_FAILED' });
+  let profile;
+  try {
+    profile = await googleProfileFromIdToken(idToken);
+  } catch (error) {
+    console.error('Google OAuth (id_token) :', error?.message || error);
+    return res.status(401).json({ error: 'OAUTH_FAILED' });
+  }
+  if (!profile.googleId || !EMAIL.test(profile.email) || !profile.emailVerified)
+    return res.status(401).json({ error: 'OAUTH_EMAIL' });
+  const user = await upsertGoogleUser(profile);
+  await createSession(req, res, user._id);
+  res.json({ user: publicUser(user) });
+}));
+
+async function uniqueUsername(base) {
+  const raw = String(base || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const stem = (raw.length >= 3 ? raw : `joueur${raw}`).slice(0, 10);
+  for (let i = 0; i < 20; i++) {
+    const candidate =
+      i === 0 ? stem.slice(0, 14) : `${stem}_${crypto.randomInt(100, 9999)}`.slice(0, 14);
+    if (!USERNAME.test(candidate)) continue;
+    const exists = await users.findOne({ usernameLower: candidate.toLowerCase() });
+    if (!exists) return candidate;
+  }
+  return `joueur_${crypto.randomBytes(3).toString('hex')}`;
+}
+
+async function upsertGoogleUser({ googleId, email, name, picture }) {
+  const now = new Date();
+  let user = await users.findOne({ googleId });
+  if (user) {
+    const set = { failedLogins: 0, lastLoginAt: now };
+    if (!user.avatarId && picture && user.avatarExternal !== picture) set.avatarExternal = picture;
+    await users.updateOne({ _id: user._id }, { $set: set, $unset: { lockUntil: '' } });
+    return users.findOne({ _id: user._id });
+  }
+  user = await users.findOne({ emailLower: email });
+  if (user) {
+    // Lie le compte Google au compte email existant (l'email est vérifié par Google).
+    const set = { googleId, failedLogins: 0, lastLoginAt: now, updatedAt: now };
+    if (!user.avatarId && !user.avatarExternal && picture) set.avatarExternal = picture;
+    await users.updateOne({ _id: user._id }, { $set: set, $unset: { lockUntil: '' } });
+    return users.findOne({ _id: user._id });
+  }
+  const username = await uniqueUsername(name || email.split('@')[0]);
+  const doc = {
+    email,
+    emailLower: email,
+    username,
+    usernameLower: username.toLowerCase(),
+    displayName: cleanText(name, 40) || username,
+    googleId,
+    authProvider: 'google',
+    passwordHash: null,
+    avatarExternal: picture || '',
+    preferences: DEFAULT_PREFS,
+    stats: { games: 0, wins: 0, boxes: 0 },
+    failedLogins: 0,
+    createdAt: now,
+    updatedAt: now,
+    lastLoginAt: now,
+  };
+  const result = await users.insertOne(doc);
+  doc._id = result.insertedId;
+  return doc;
+}
+
+// Tant que MongoDB n'est pas connecté, les autres routes répondent proprement.
+app.use('/api', (_req, res, next) => {
+  if (dbReady) return next();
+  res.status(503).json({ error: 'DB_UNAVAILABLE', reason: dbIssue });
+});
+
+/* ------------------------------ auth (email) ------------------------------ */
 
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const email = cleanText(req.body.email, 120).toLowerCase();
@@ -267,6 +438,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     username,
     usernameLower: username.toLowerCase(),
     displayName: username,
+    authProvider: 'email',
     passwordHash: await bcrypt.hash(password, 12),
     preferences: DEFAULT_PREFS,
     stats: { games: 0, wins: 0, boxes: 0 },
@@ -289,6 +461,8 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
 
   const user = await users.findOne({ $or: [{ emailLower: identifier }, { usernameLower: identifier }] });
   if (user?.lockUntil && user.lockUntil > new Date()) return res.status(429).json({ error: 'ACCOUNT_LOCKED' });
+  if (user && !user.passwordHash && user.googleId)
+    return res.status(401).json({ error: 'OAUTH_ACCOUNT' });
 
   const valid = !!user?.passwordHash && (await bcrypt.compare(password, user.passwordHash));
   if (!valid) {
@@ -329,8 +503,11 @@ app.post('/api/auth/password', requireUser, asyncRoute(async (req, res) => {
   const current = String(req.body.currentPassword || '');
   const next = String(req.body.newPassword || '');
   if (next.length < 8 || next.length > 128) return res.status(400).json({ error: 'WEAK_PASSWORD' });
-  if (!req.user.passwordHash || !(await bcrypt.compare(current, req.user.passwordHash)))
-    return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+  if (req.user.passwordHash) {
+    if (!(await bcrypt.compare(current, req.user.passwordHash)))
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+  }
+  // Compte Google sans mot de passe : on autorise sa définition sans l'ancien.
   await users.updateOne(
     { _id: req.userId },
     { $set: { passwordHash: await bcrypt.hash(next, 12), updatedAt: new Date() } },
@@ -545,6 +722,30 @@ app.get('/api/matches', requireUser, asyncRoute(async (req, res) => {
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API_NOT_FOUND' }));
 
+/* ------------------------------ démarrage ------------------------------ */
+
+const server = app.listen(port, host, () => {
+  const shown = host === '0.0.0.0' ? 'localhost' : host;
+  console.log(`Box prête sur http://${shown}:${port} (PeerJS : /peerjs)`);
+  if (googleReady) console.log('Google OAuth actif.');
+  void connectDb();
+});
+
+// Serveur PeerJS auto-hébergé sur le MÊME port : le multijoueur ne dépend plus
+// du cloud public PeerJS (source des pannes « serveur en ligne »). Le client
+// se connecte sur /peerjs (voir VITE_PEER_* pour forcer un autre serveur).
+const peerServer = ExpressPeerServer(server, { path: '/', proxied: true, allow_discovery: false });
+app.use('/peerjs', peerServer);
+
+// Sert l'interface construite (npm run build) : une seule adresse pour le site ET l'API.
+const dist = path.join(root, 'dist');
+if (fs.existsSync(path.join(dist, 'index.html'))) {
+  app.use(express.static(dist, { maxAge: prod ? '1y' : 0, index: false }));
+  app.use((_req, res) => res.sendFile(path.join(dist, 'index.html'))); // SPA : toujours index.html
+} else {
+  console.log('dist/ absent : API seule. Lance « npm run build » pour servir aussi l’interface.');
+}
+
 app.use((err, _req, res, _next) => {
   console.error(err);
   if (err?.code === 11000) return res.status(409).json({ error: 'DUPLICATE_VALUE' });
@@ -552,17 +753,6 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'SERVER_ERROR' });
 });
 
-// Sert l'interface construite (npm run build) : une seule adresse pour le site ET l'API.
-const dist = path.join(root, 'dist');
-if (fs.existsSync(path.join(dist, 'index.html'))) {
-  app.use(express.static(dist, { maxAge: prod ? '1y' : 0 }));
-  app.use((_req, res) => res.sendFile(path.join(dist, 'index.html')));
-}
-
-const server = app.listen(port, () => {
-  console.log(`Box prête sur http://localhost:${port}`);
-  void connectDb();
-});
 async function shutdown() {
   server.close();
   await mongo?.close();

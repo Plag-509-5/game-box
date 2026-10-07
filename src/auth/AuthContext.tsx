@@ -1,7 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
+  ApiError,
   api,
+  consumeAuthRedirect,
   errorLabel,
+  getProviders,
+  type AuthProviders,
   type BoxUser,
   type CloudMatch,
   type Friendship,
@@ -16,6 +20,7 @@ interface AuthContextValue {
   loading: boolean;
   busy: boolean;
   error: string;
+  providers: AuthProviders | null;
   clearError: () => void;
   login: (identifier: string, password: string) => Promise<boolean>;
   register: (email: string, username: string, password: string) => Promise<boolean>;
@@ -51,6 +56,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [providers, setProviders] = useState<AuthProviders | null>(null);
 
   const guard = useCallback(async <T,>(job: () => Promise<T>): Promise<T | null> => {
     setBusy(true);
@@ -76,6 +82,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let live = true;
+    // Retour du flux Google OAuth (?auth=…) : erreur affichable, succès = session cookie.
+    const redirect = consumeAuthRedirect();
+    if (redirect?.status === 'error') setError(errorLabel(new ApiError(redirect.reason, 400)));
+    void getProviders().then((p) => {
+      if (live) setProviders(p);
+    });
     api<{ user: BoxUser }>('/users/me')
       .catch(() => null)
       .then(async (session) => {
@@ -114,6 +126,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       loading,
       busy,
       error,
+      providers,
       clearError: () => setError(''),
       login: (identifier, password) =>
         consumeAuth(
@@ -219,6 +232,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       loading,
       busy,
       error,
+      providers,
       consumeAuth,
       guard,
       refreshSocial,

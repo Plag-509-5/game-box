@@ -17,7 +17,8 @@ export interface BoxUser {
   username: string;
   displayName: string;
   avatarUrl: string;
-  authProvider: 'email';
+  authProvider: 'email' | 'google';
+  hasPassword: boolean;
   preferences: UserPreferences;
   stats: { games: number; wins: number; boxes: number };
   createdAt: string;
@@ -85,6 +86,50 @@ function apiCandidates() {
 
 export function currentApiBase() {
   return apiCandidates()[0];
+}
+
+export interface AuthProviders {
+  google: boolean;
+}
+
+/** Fournisseurs OAuth activés côté serveur (toujours disponible, même sans DB). */
+export async function getProviders(): Promise<AuthProviders> {
+  try {
+    return await api<AuthProviders>('/auth/providers');
+  } catch {
+    return { google: false };
+  }
+}
+
+/** URL de démarrage du flux « Continuer avec Google » (redirection top-level). */
+export function googleStartUrl() {
+  return `${currentApiBase()}/auth/google`;
+}
+
+export type AuthRedirect =
+  | { status: 'google-ok' }
+  | { status: 'error'; reason: string }
+  | null;
+
+/**
+ * Consomme le retour OAuth (?auth=google-ok ou ?auth=error&reason=…) après
+ * redirection du serveur, puis nettoie l'URL (le hash #CODE éventuel est gardé).
+ */
+export function consumeAuthRedirect(): AuthRedirect {
+  try {
+    const url = new URL(window.location.href);
+    const auth = url.searchParams.get('auth');
+    if (!auth) return null;
+    const reason = url.searchParams.get('reason') || 'OAUTH_FAILED';
+    url.searchParams.delete('auth');
+    url.searchParams.delete('reason');
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    if (auth === 'google-ok') return { status: 'google-ok' };
+    if (auth === 'error') return { status: 'error', reason };
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export type ServiceState =
@@ -156,6 +201,11 @@ export function avatarSrc(url: string) {
 }
 
 export const ERROR_LABELS: Record<string, string> = {
+  OAUTH_NOT_CONFIGURED: 'La connexion Google n’est pas configurée sur ce serveur.',
+  OAUTH_FAILED: 'La connexion Google a échoué. Réessaie.',
+  OAUTH_STATE: 'La session Google a expiré. Recommence la connexion.',
+  OAUTH_EMAIL: 'Google n’a pas fourni d’adresse email vérifiée.',
+  OAUTH_ACCOUNT: 'Ce compte utilise « Continuer avec Google ». Définis un mot de passe pour utiliser l’email.',
   INVALID_EMAIL: 'Adresse email invalide.',
   INVALID_USERNAME: 'Le pseudo doit contenir 3 à 14 lettres, chiffres, - ou _.',
   WEAK_PASSWORD: 'Le mot de passe doit contenir au moins 8 caractères.',
